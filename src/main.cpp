@@ -86,7 +86,14 @@ volatile float roll_angle      = 0.0f;
 volatile float pitch_angle     = 0.0f;
 volatile float yaw_angle       = 0.0f;
 volatile float altitude        = 0.0f;
-volatile int16_t tof_front     = 0.0;
+volatile int16_t tof_front     = 0;
+volatile float interval_time   = 0.0f;
+volatile float thrust_command  = 0.0f;
+volatile float accel_z_raw     = 0.0f;
+volatile float alt_velocity    = 0.0f;
+volatile float altitude2       = 0.0f;
+volatile float motor_fl        = 0.0f;
+volatile float motor_rr        = 0.0f;
 
 volatile uint8_t alt_flag      = 0;
 volatile uint8_t fly_mode      = 0;
@@ -116,6 +123,14 @@ struct data_to_send{
     float pitch;
     float yaw;
     float voltage;
+    float interval_time;
+    float thrust_command;
+    float accel_z_raw;
+    float alt_velocity;
+    float altitude;
+    float altitude2;
+    float motor_fl;
+    float motor_rr;
     int alt_flag;
     int fly_mode;
     int tof_front;
@@ -129,35 +144,64 @@ void show_battery_info();
 void voltage_print(void);
 void task_tone(void *pvParameters);
 
-//void sendHttpPost(float roll, float pitch, float yaw, float voltage, int alt_flag, int fly_mode, int tof_front) {
+String buildLineProtocol(const data_to_send &m) {
+    return "m5stampFly,location=home"
+           " roll=" + String(m.roll, 2)
+         + ",pitch=" + String(m.pitch, 2)
+         + ",yaw=" + String(m.yaw, 2)
+         + ",voltage=" + String(m.voltage, 2)
+         + ",thrust=" + String(m.thrust_command, 4)
+         + ",accel_z=" + String(m.accel_z_raw, 3)
+         + ",alt_velocity=" + String(m.alt_velocity, 3)
+         + ",altitude=" + String(m.altitude, 3)
+         + ",altitude_filtered=" + String(m.altitude2, 3)
+         + ",motor_fl=" + String(m.motor_fl, 4)
+         + ",motor_rr=" + String(m.motor_rr, 4)
+         + ",loop_dt=" + String(m.interval_time, 6)
+         + ",alt_flag=" + String(m.alt_flag)
+         + ",fly_mode=" + String(m.fly_mode)
+         + ",tof_front=" + String(m.tof_front);
+}
+
 void sendHttpPost(void *parameter) {
-    HTTPClient http;
-    String postData = "";
-    
-    http.begin("https://" + grafana_username + ":" + grafana_password + "@" + grafana_url + "/api/v1/push/influx/write");  // Specify the URL
-    http.addHeader("Content-Type", "application/json");  // Set content type
-
     data_to_send message;
+    unsigned long lastReconnectAttempt = 0;
+    const unsigned long RECONNECT_INTERVAL_MS = 5000;
+    const int MAX_BATCH = 5;
+
     while (true) {
-        // Wait for data from the queue (Blocks until data arrives)
         if (xQueueReceive(WiFiQueue, &message, portMAX_DELAY)) {
-            if (WiFi.status() == WL_CONNECTED) {
-                USBSerial.printf("Reveived in thread buffer: %f,%f,%f,%f,%d,%d,%d\n\r", message.roll, message.pitch, message.yaw, message.voltage, message.alt_flag, message.fly_mode, message.tof_front);
-                postData = "m5stampFly,location=home roll=" + String(message.roll)
-                          + ",pitch=" + String(message.pitch)
-                          + ",yaw=" + String(message.yaw)
-                          + ",voltage=" + String(message.voltage)
-                          + ",alt_flag=" + String(message.alt_flag)
-                          + ",fly_mode=" + String(message.fly_mode)
-                          + ",tof_front=" + String(message.tof_front);
-
-                int httpResponseCode = http.POST(postData);
-
-
+            if (WiFi.status() != WL_CONNECTED) {
+                unsigned long now = millis();
+                if (now - lastReconnectAttempt > RECONNECT_INTERVAL_MS) {
+                    lastReconnectAttempt = now;
+                    USBSerial.println("Wi-Fi disconnected, attempting reconnect...");
+                    WiFi.reconnect();
+                }
+                continue;
             }
+
+            String postData = buildLineProtocol(message);
+            int batchCount = 1;
+
+            while (batchCount < MAX_BATCH && xQueueReceive(WiFiQueue, &message, 0) == pdPASS) {
+                postData += "\n" + buildLineProtocol(message);
+                batchCount++;
+            }
+
+            HTTPClient http;
+            http.begin("https://" + grafana_username + ":" + grafana_password + "@" + grafana_url + "/api/v1/push/influx/write");
+            http.addHeader("Content-Type", "text/plain");
+
+            int httpResponseCode = http.POST(postData);
+            if (httpResponseCode > 0) {
+                USBSerial.printf("Telemetry batch sent (%d): %d samples\n", httpResponseCode, batchCount);
+            } else {
+                USBSerial.printf("HTTP POST failed: %s\n", http.errorToString(httpResponseCode).c_str());
+            }
+            http.end();
         }
     }
-    http.end();
 }
 
 // 受信コールバック
@@ -176,11 +220,18 @@ void OnDataRecv(const uint8_t *mac_addr, const uint8_t *recv_data, int data_len)
         }
     } else {
         if (recv_data[0] == 88 && recv_data[1] == 88) {
-            memcpy((uint8_t *)&roll_angle, &recv_data[2 + 4 * (3 - 1)], 4);
-            memcpy((uint8_t *)&pitch_angle, &recv_data[2 + 4 * (4 - 1)], 4);
-            memcpy((uint8_t *)&yaw_angle, &recv_data[2 + 4 * (5 - 1)], 4);
-            memcpy((uint8_t *)&fly_bat_voltage, &recv_data[2 + 4 * (15 - 1)], 4);
-            memcpy((uint8_t *)&altitude, &recv_data[2 + 4 * (25 - 1)], 4);
+            memcpy((uint8_t *)&interval_time,   &recv_data[2 + 4 * (2 - 1)],  4);  // field 2
+            memcpy((uint8_t *)&roll_angle,       &recv_data[2 + 4 * (3 - 1)],  4);  // field 3
+            memcpy((uint8_t *)&pitch_angle,      &recv_data[2 + 4 * (4 - 1)],  4);  // field 4
+            memcpy((uint8_t *)&yaw_angle,        &recv_data[2 + 4 * (5 - 1)],  4);  // field 5
+            memcpy((uint8_t *)&thrust_command,   &recv_data[2 + 4 * (14 - 1)], 4);  // field 14
+            memcpy((uint8_t *)&fly_bat_voltage,  &recv_data[2 + 4 * (15 - 1)], 4);  // field 15
+            memcpy((uint8_t *)&accel_z_raw,      &recv_data[2 + 4 * (18 - 1)], 4);  // field 18
+            memcpy((uint8_t *)&alt_velocity,     &recv_data[2 + 4 * (19 - 1)], 4);  // field 19
+            memcpy((uint8_t *)&motor_fl,         &recv_data[2 + 4 * (21 - 1)], 4);  // field 21
+            memcpy((uint8_t *)&motor_rr,         &recv_data[2 + 4 * (22 - 1)], 4);  // field 22
+            memcpy((uint8_t *)&altitude2,        &recv_data[2 + 4 * (24 - 1)], 4);  // field 24
+            memcpy((uint8_t *)&altitude,         &recv_data[2 + 4 * (25 - 1)], 4);  // field 25
             alt_flag = recv_data[2 + 4 * (28 - 1)];
             fly_mode = recv_data[2 + 4 * (28 - 1) + 1];
             memcpy((uint8_t *)&tof_front, &recv_data[2 + 4 * (28 - 1) + 2], 2);
@@ -188,15 +239,19 @@ void OnDataRecv(const uint8_t *mac_addr, const uint8_t *recv_data, int data_len)
             if (fly_mode == PARKING_MODE) {
                 fly_status_manual = 0;
             }
-            USBSerial.printf("roll:%.2f, pitch:%.2f, yaw:%.2f, voltage:%.2f, alt_flag:%d, fly_mode:%d, tof_front:%d\r\n", roll_angle, pitch_angle, yaw_angle, fly_bat_voltage, alt_flag, fly_mode, tof_front);
 
-            if (millis() - lastSendTime >= 1000) {
+            if (millis() - lastSendTime >= 200) {
                 lastSendTime = millis();
 
-                data_to_send d = {roll_angle, pitch_angle, yaw_angle, fly_bat_voltage, alt_flag, fly_mode, tof_front};
-             
-                if (xQueueSend(WiFiQueue, &d, portMAX_DELAY) != pdPASS) {
-                    USBSerial.println("Queue is full! Failed to send message.");
+                data_to_send d = {
+                    roll_angle, pitch_angle, yaw_angle, fly_bat_voltage,
+                    interval_time, thrust_command, accel_z_raw, alt_velocity,
+                    altitude, altitude2, motor_fl, motor_rr,
+                    alt_flag, fly_mode, tof_front
+                };
+
+                if (xQueueSend(WiFiQueue, &d, 0) != pdPASS) {
+                    USBSerial.println("Queue full, telemetry sample dropped");
                 }
             }
 
@@ -258,21 +313,22 @@ void load_data(void) {
 
 void rc_init(uint8_t ch, uint8_t *addr) {
 
-    data_to_send d = {0, 0, 0, 0, 0, 0, 0};
-    WiFiQueue = xQueueCreate(60, sizeof(d));
+    data_to_send d = {};
+    WiFiQueue = xQueueCreate(15, sizeof(d));
     if (WiFiQueue == NULL) {
         Serial.println("Error creating queue!");
         return;
     }
 
     
-    xTaskCreate(
+    xTaskCreatePinnedToCore(
         sendHttpPost,    // Function
         "sendHttpPost",  // Task name
-        4096,            // Stack size
+        8192,            // Stack size (TLS needs headroom)
         NULL,            // Task parameters
         1,               // Priority
-        &WiFiTaskHandle  // Task handle
+        &WiFiTaskHandle, // Task handle
+        0                // Core 0 (WiFi stack lives here; keeps core 1 free for control loop)
     );
 
     // ESP-NOW初期化
@@ -304,17 +360,23 @@ void rc_init(uint8_t ch, uint8_t *addr) {
     USBSerial.print("Using ESP-NOW on Channel: ");
     USBSerial.println(channel2);
 
-    // Connect to Wi-Fi (Station Mode)
+    // Connect to Wi-Fi with timeout so the controller remains usable without internet
     WiFi.mode(WIFI_STA);
     WiFi.begin(ssid, password);
     USBSerial.print("Connecting to Wi-Fi");
-    while (WiFi.status() != WL_CONNECTED) {
+    unsigned long wifi_start = millis();
+    const unsigned long WIFI_TIMEOUT_MS = 10000;
+    while (WiFi.status() != WL_CONNECTED && (millis() - wifi_start) < WIFI_TIMEOUT_MS) {
         USBSerial.print(".");
-        delay(1000);
+        delay(500);
     }
-    USBSerial.printf("\nWi-Fi connected!");
-    USBSerial.print("IP Address: ");
-    USBSerial.println(WiFi.localIP());
+    if (WiFi.status() == WL_CONNECTED) {
+        USBSerial.printf("\nWi-Fi connected!");
+        USBSerial.print("IP Address: ");
+        USBSerial.println(WiFi.localIP());
+    } else {
+        USBSerial.println("\nWi-Fi connection timed out - continuing without telemetry upload");
+    }
     
     int wifi_channel = WiFi.channel();
     USBSerial.print("Current Wi-Fi Channel: ");
